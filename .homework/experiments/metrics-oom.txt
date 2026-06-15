@@ -1,0 +1,6 @@
+# HELP huatuo_bamai_oom_host_total host oom counter
+# TYPE huatuo_bamai_oom_host_total counter
+huatuo_bamai_oom_host_total{host="zzz",region="example"} 0
+huatuo_bamai_scrape_collector_duration_seconds{collector="oom",host="zzz",region="example"} 2.9473e-05
+huatuo_bamai_scrape_collector_success{collector="oom",host="zzz",region="example"} 1
+huatuo_bamai_tracing_status_hitcount{host="zzz",region="example",tracing="oom"} 0

@@ -1,0 +1,22 @@
+# WSL bridge 网络：Grafana 容器内 localhost 不是 Prometheus，需用服务名
+apiVersion: 1
+
+deleteDatasources:
+  - name: huatuo-bamai-prom
+
+prune: true
+
+datasources:
+  - name: huatuo-bamai-prom
+    type: prometheus
+    access: proxy
+    orgId: 1
+    uid: huatuo-bamai-prom
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      prometheusType: Prometheus
+      cacheLevel: 'High'
+      disableRecordingRules: false
+      incrementalQueryOverlapWindow: 10m

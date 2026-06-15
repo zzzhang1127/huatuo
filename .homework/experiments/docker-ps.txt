@@ -1,0 +1,5 @@
+NAMES           STATUS
+elasticsearch   Up
+grafana         Up
+prometheus      Up
+huatuo-bamai    在 WSL Ubuntu 主机上以 root 直接运行（非 compose 容器）

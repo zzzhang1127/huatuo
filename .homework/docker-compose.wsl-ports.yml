@@ -1,0 +1,43 @@
+# WSL / Docker Desktop：取消 host 网络，使用同一 compose 网络（Grafana 可解析 prometheus）
+# 用法:
+#   docker compose -f build/docker/docker-compose.yml -f .homework/docker-compose.wsl-ports.yml up -d
+
+networks:
+  huatuo-obs:
+    driver: bridge
+
+services:
+  elasticsearch:
+    network_mode: !reset
+    networks:
+      - huatuo-obs
+    ports:
+      - "9200:9200"
+
+  prometheus:
+    network_mode: !reset
+    networks:
+      - huatuo-obs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../.homework/prometheus-wsl-scrape.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  # WSL 实验在主机用 systemd 跑 huatuo，不要启动 compose 里的 huatuo-bamai
+  huatuo-bamai:
+    profiles:
+      - wsl-no-huatuo-container
+
+  grafana:
+    network_mode: !reset
+    networks:
+      - huatuo-obs
+    environment:
+      - GF_SERVER_ROOT_URL=http://localhost:3000/
+    volumes:
+      - ../../.homework/grafana-datasources/prometheus-wsl.yaml:/etc/grafana/provisioning/datasources/prometheus.yaml:ro
+      - ../../.homework/grafana-datasources/elasticsearch-wsl.yaml:/etc/grafana/provisioning/datasources/elasticsearch.yaml:ro
+    ports:
+      - "3000:3000"

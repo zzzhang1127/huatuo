@@ -49,8 +49,9 @@ services:
       - /run:/run:rw
       - /etc:/etc:ro
       - /var:/var:ro
-      - ../../huatuo-bamai.conf:${RUN_PATH}/conf/huatuo-bamai.conf:rw
+      - ../../huatuo-bamai.conf:${RUN_PATH}/huatuo-bamai.conf:rw
       - ./run.sh:${RUN_PATH}/run.sh:ro
+    working_dir: /home/huatuo-bamai
     command: ["./run.sh"]
     depends_on:
       - elasticsearch

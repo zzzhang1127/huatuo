@@ -1,0 +1,24 @@
+# WSL bridge 网络：Grafana 容器内 localhost 不是 Elasticsearch
+apiVersion: 1
+
+deleteDatasources:
+  - name: huatuo-bamai-es
+
+prune: true
+
+datasources:
+  - name: huatuo-bamai-es
+    type: elasticsearch
+    access: proxy
+    orgId: 1
+    uid: huatuo-bamai-es
+    url: http://elasticsearch:9200
+    user: elastic
+    database:
+    jsonData:
+      index: 'huatuo_bamai*'
+      timeField: 'uploaded_time'
+    secureJsonData:
+      password: huatuo-bamai
+    version: 1
+    editable: false
