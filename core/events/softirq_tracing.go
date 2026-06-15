@@ -23,8 +23,7 @@ import (
 	"time"
 
 	"huatuo-bamai/internal/bpf"
-	"huatuo-bamai/internal/conf"
-	"huatuo-bamai/internal/storage"
+	"huatuo-bamai/internal/log"
 	"huatuo-bamai/internal/symbol"
 	"huatuo-bamai/internal/utils/bytesutil"
 	"huatuo-bamai/pkg/tracing"
@@ -36,7 +35,7 @@ import (
 type softirqTracing struct{}
 
 type softirqPerfEvent struct {
-	Stack     [symbol.KsymbolStackMaxDepth]uint64
+	Stack     [symbol.KsymStackMaxDepth]uint64
 	StackSize int64
 	Now       uint64
 	StallTime uint64
@@ -69,7 +68,7 @@ func newSoftirq() (*tracing.EventTracingAttr, error) {
 }
 
 func (c *softirqTracing) Start(ctx context.Context) error {
-	softirqThresh := conf.Get().EventTracing.Softirq.DisabledThreshold
+	softirqThresh := cfg.Softirq.DisabledThreshold
 
 	b, err := bpf.LoadBpf(bpf.ThisBpfOBJ(), map[string]any{"softirq_thresh": softirqThresh})
 	if err != nil {
@@ -102,7 +101,7 @@ func (c *softirqTracing) Start(ctx context.Context) error {
 			if err := reader.ReadInto(&data); err != nil {
 				return fmt.Errorf("Read From Perf Event fail: %w", err)
 			}
-			comm := bytesutil.ToString(data.Comm[:])
+			comm := bytesutil.ToStr(data.Comm[:])
 			index := strings.Index(comm, "ksoftirqd")
 
 			if index == 0 {
@@ -122,23 +121,29 @@ func (c *softirqTracing) Start(ctx context.Context) error {
 				stack = softirqDumpTrace(data.Stack[:])
 			}
 
-			storage.Save("softirq_tracing", "", time.Now(), &SoftirqTracingData{
-				OffTime:   data.StallTime,
-				Threshold: softirqThresh,
-				Comm:      comm,
-				Pid:       data.Pid,
-				CPU:       data.CPU,
-				Now:       data.Now,
-				Stack:     fmt.Sprintf("stack:\n%s", stack),
-			})
+			if err := tracing.Save(&tracing.WriteRequest{
+				TracerName: "softirq_tracing",
+				TracerTime: time.Now(),
+				TracerData: &SoftirqTracingData{
+					OffTime:   data.StallTime,
+					Threshold: softirqThresh,
+					Comm:      comm,
+					Pid:       data.Pid,
+					CPU:       data.CPU,
+					Now:       data.Now,
+					Stack:     fmt.Sprintf("stack:\n%s", stack),
+				},
+			}); err != nil {
+				log.Warnf("failed to save tracing data: %v", err)
+			}
 		}
 	} // forever
 }
 
 // softirqDumpTrace is an interface for dump stacks in this case with offset and module info
 func softirqDumpTrace(addrs []uint64) string {
-	stacks := symbol.DumpKernelBackTrace(addrs, symbol.KsymbolStackMaxDepth)
-	return strings.Join(stacks.BackTrace, "\n")
+	stacks := symbol.KsymStackStrs(addrs, symbol.KsymStackMaxDepth)
+	return strings.Join(stacks, "\n")
 }
 
 func attachIrqAndEventPipe(ctx context.Context, b bpf.BPF) (bpf.PerfEventReader, error) {

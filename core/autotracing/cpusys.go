@@ -25,10 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"huatuo-bamai/internal/conf"
+	internalconfig "huatuo-bamai/internal/config"
 	"huatuo-bamai/internal/flamegraph"
 	"huatuo-bamai/internal/log"
-	"huatuo-bamai/internal/storage"
 	"huatuo-bamai/pkg/tracing"
 	"huatuo-bamai/pkg/types"
 )
@@ -132,7 +131,7 @@ func runPerfSystemWide(parent context.Context, timeOut int64) ([]byte, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, path.Join(tracing.TaskBinDir, "perf"),
-		"--bpf-obj", "cpuidle.o",
+		"--bpf-path", path.Join(internalconfig.CoreBpfDir, "perf.o"),
 		"--duration", strconv.FormatInt(timeOut, 10))
 
 	return cmd.CombinedOutput()
@@ -151,17 +150,24 @@ func (c *cpuSysTracing) buildAndSaveCPUSystem(traceTime time.Time, threshold *cp
 	}
 
 	log.Debugf("cpuidle flamedata %v", tracerData.FlameData)
-	storage.Save("cpusys", "", traceTime, &tracerData)
+	if err := tracing.Save(&tracing.WriteRequest{
+		TracerName:    "cpusys",
+		TracerTime:    traceTime,
+		TracerData:    &tracerData,
+		TracerRunType: tracing.TracerRunTypeAutotracing,
+	}); err != nil {
+		log.Warnf("failed to save tracing data: %v", err)
+	}
 	return nil
 }
 
 func (c *cpuSysTracing) Start(ctx context.Context) error {
-	interval := conf.Get().AutoTracing.CPUSys.Interval
-	perfRunTimeOut := conf.Get().AutoTracing.CPUSys.PerfRunTimeOut
+	interval := cfg.CPUSys.Interval
+	perfRunTimeOut := cfg.CPUSys.RunTracingToolTimeout
 
 	threshold := &cpuSysThreshold{
-		delta: conf.Get().AutoTracing.CPUSys.DeltaSysThreshold,
-		usage: conf.Get().AutoTracing.CPUSys.SysThreshold,
+		delta: cfg.CPUSys.DeltaSysThreshold,
+		usage: cfg.CPUSys.SysThreshold,
 	}
 
 	for {

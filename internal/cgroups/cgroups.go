@@ -57,6 +57,8 @@ type Cgroup interface {
 	// Pids return pids of cgroups
 	Pids(path string) ([]int32, error)
 	// CpuUsage return cgroups user/system and total usage.
+	// Procs returns pids of cgroups process IDs
+	Procs(path string) ([]int32, error)
 	CpuUsage(path string) (*stats.CpuUsage, error)
 	// CpuStatRaw return cpu.stat raw data
 	CpuStatRaw(path string) (map[string]uint64, error)
@@ -71,7 +73,7 @@ type Cgroup interface {
 	MemoryUsage(path string) (*stats.MemoryUsage, error)
 }
 
-func NewCgroupManager() (Cgroup, error) {
+func NewManager() (Cgroup, error) {
 	// https://github.com/systemd/systemd/blob/main/docs/CGROUP_DELEGATION.md
 	//
 	// Legacy — this is the traditional cgroup v1 mode. In this mode the various

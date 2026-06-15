@@ -20,10 +20,8 @@ import (
 	"time"
 
 	"huatuo-bamai/internal/bpf"
-	"huatuo-bamai/internal/conf"
 	"huatuo-bamai/internal/log"
 	"huatuo-bamai/internal/pod"
-	"huatuo-bamai/internal/storage"
 	"huatuo-bamai/internal/utils/bytesutil"
 	"huatuo-bamai/pkg/tracing"
 )
@@ -63,7 +61,7 @@ const cssCacheTTL = 5 * time.Second
 // Start detect work, load bpf and wait data form perfevent
 func (c *memoryReclaimTracing) Start(ctx context.Context) error {
 	b, err := bpf.LoadBpf(bpf.ThisBpfOBJ(), map[string]any{
-		"deltath": conf.Get().EventTracing.MemoryReclaim.BlockedThreshold,
+		"deltath": cfg.MemoryReclaim.BlockedThreshold,
 	})
 	if err != nil {
 		return err
@@ -132,12 +130,19 @@ func (c *memoryReclaimTracing) Start(ctx context.Context) error {
 			// save storage
 			tracingData := &MemoryReclaimTracingData{
 				Pid:       data.Pid,
-				Comm:      bytesutil.ToString(data.Comm[:]),
+				Comm:      bytesutil.ToStr(data.Comm[:]),
 				Deltatime: data.Deltatime,
 			}
 
 			log.Infof("memory_reclaim saves storage: %+v", tracingData)
-			storage.Save("memory_reclaim", container.ID, time.Now(), tracingData)
+			if err := tracing.Save(&tracing.WriteRequest{
+				TracerName:  "memory_reclaim",
+				ContainerID: container.ID,
+				TracerTime:  time.Now(),
+				TracerData:  tracingData,
+			}); err != nil {
+				log.Warnf("failed to save tracing data: %v", err)
+			}
 		}
 	}
 }

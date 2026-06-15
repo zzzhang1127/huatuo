@@ -18,7 +18,8 @@ import (
 	"fmt"
 
 	"huatuo-bamai/internal/cgroups"
-	"huatuo-bamai/internal/conf"
+	"huatuo-bamai/internal/matcher"
+
 	"huatuo-bamai/internal/pod"
 	"huatuo-bamai/pkg/metric"
 	"huatuo-bamai/pkg/tracing"
@@ -33,7 +34,7 @@ func init() {
 }
 
 func newMemEvents() (*tracing.EventTracingAttr, error) {
-	cgroup, _ := cgroups.NewCgroupManager()
+	cgroup, _ := cgroups.NewManager()
 
 	return &tracing.EventTracingAttr{
 		TracingData: &memEventsCollector{
@@ -43,8 +44,10 @@ func newMemEvents() (*tracing.EventTracingAttr, error) {
 }
 
 func (c *memEventsCollector) Update() ([]*metric.Data, error) {
-	filter := newFieldFilter(conf.Get().MetricCollector.MemoryEvents.Excluded,
-		conf.Get().MetricCollector.MemoryEvents.Included)
+	f, err := matcher.NewValueMatcher(cfg.MemoryEvents.Included, cfg.MemoryEvents.Excluded)
+	if err != nil {
+		return nil, fmt.Errorf("memory events filter: %w", err)
+	}
 
 	containers, err := pod.NormalContainers()
 	if err != nil {
@@ -59,7 +62,7 @@ func (c *memEventsCollector) Update() ([]*metric.Data, error) {
 		}
 
 		for key, value := range raw {
-			if filter.ignored(key) {
+			if !f.Match(key) {
 				continue
 			}
 

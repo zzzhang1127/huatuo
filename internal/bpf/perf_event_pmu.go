@@ -20,6 +20,7 @@
 package bpf
 
 import (
+	"fmt"
 	"runtime"
 
 	"github.com/cilium/ebpf"
@@ -33,13 +34,39 @@ const (
 	sampleTypeFreq   = 2
 )
 
-type perfEventPMUOption struct {
+type perfEventPMU struct {
+	fds []int
+}
+
+type pmuOption struct {
 	samplePeriodFreq uint64
 	sampleType       uint32
 	program          *ebpf.Program
 }
 
-func attach(attr *unix.PerfEventAttr, progFD, cpuId int) (int, error) {
+func (opt *pmuOption) Validate() error {
+	if opt == nil {
+		return fmt.Errorf("options required")
+	}
+
+	var errs []error
+
+	if opt.program == nil {
+		errs = append(errs, fmt.Errorf("program required"))
+	}
+
+	if opt.samplePeriodFreq == 0 {
+		errs = append(errs, fmt.Errorf("samplePeriodFreq required"))
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("invalid options: %v", errs)
+}
+
+func perfEventOpenWithBPF(attr *unix.PerfEventAttr, progFD, cpuId int) (int, error) {
 	fd, err := unix.PerfEventOpen(attr, -1, cpuId, -1, unix.PERF_FLAG_FD_CLOEXEC)
 	if err != nil {
 		return -1, err
@@ -58,7 +85,11 @@ func attach(attr *unix.PerfEventAttr, progFD, cpuId int) (int, error) {
 	return fd, nil
 }
 
-func attachPerfEventPMU(opt *perfEventPMUOption) (*perfEventPMU, error) {
+func attachPerfEventPMU(opt *pmuOption) (*perfEventPMU, error) {
+	if err := opt.Validate(); err != nil {
+		return nil, err
+	}
+
 	attr := unix.PerfEventAttr{
 		Type:   unix.PERF_TYPE_SOFTWARE,
 		Size:   unix.PERF_ATTR_SIZE_VER0,
@@ -73,7 +104,7 @@ func attachPerfEventPMU(opt *perfEventPMUOption) (*perfEventPMU, error) {
 
 	var fds []int
 	for i := 0; i < runtime.NumCPU(); i++ {
-		fd, err := attach(&attr, opt.program.FD(), i)
+		fd, err := perfEventOpenWithBPF(&attr, opt.program.FD(), i)
 		if err != nil {
 			for _, fd := range fds {
 				_ = unix.Close(fd)
@@ -85,11 +116,6 @@ func attachPerfEventPMU(opt *perfEventPMUOption) (*perfEventPMU, error) {
 	}
 
 	return &perfEventPMU{fds: fds}, nil
-}
-
-// inner perfEventPMU implements
-type perfEventPMU struct {
-	fds []int
 }
 
 func (p *perfEventPMU) detach() error {

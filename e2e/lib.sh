@@ -75,11 +75,16 @@ assert_kubelet_pod_count() {
 		assert_eq "$actual" "$expect" "$desc"
 	}
 
-	wait_until \
+	if ! wait_until \
 		"$((WAIT_HUATUO_BAMAI_TIMEOUT / 2))" \
 		"${WAIT_HUATUO_BAMAI_INTERVAL}" \
 		"$desc" \
-		_assert
+		_assert; then
+		# wait timeout, dump pods from kubelet
+		kubelet_pods_json
+
+		fatal "❌ wait timeout, kubelet pod count not expected"
+	fi
 }
 
 assert_huatuo_bamai_pod_count() {
@@ -90,20 +95,28 @@ assert_huatuo_bamai_pod_count() {
 		assert_eq "$actual" "$expect" "$desc"
 	}
 
-	wait_until \
+	if ! wait_until \
 		"$((WAIT_HUATUO_BAMAI_TIMEOUT / 2))" \
 		"${WAIT_HUATUO_BAMAI_INTERVAL}" \
 		"$desc" \
-		_assert
+		_assert; then
+		# wait timeout, dump pods from huatuo-bamai
+		curl "${CURL_TIMEOUT[@]}" ${HUATUO_BAMAI_PODS_API}
+
+		fatal "❌ wait timeout, huatuo-bamai pod count not expected"
+	fi
 }
 
 e2e_test_teardown() {
 	local code=$1
 
 	huatuo_bamai_stop || true
-	huatuo_bamai_log_check || true
+	if ! huatuo_bamai_log_check; then
+		log_error "❌ huatuo-bamai log check failed"
+		code=1
+	fi
 
-	if [[ $code -ne 0 ]]; then
+	if [ $code -ne 0 ]; then
 		fatal "❌ e2e test failed with exit code: $code"
 	fi
 }

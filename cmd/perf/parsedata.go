@@ -49,8 +49,8 @@ type eventdata struct {
 
 // CgDumpTrace is an interface for dump stacks in cgusage case
 func CgDumpTrace(addrs []uint64) string {
-	stacks := symbol.DumpKernelBackTrace(addrs, perfStackDepth)
-	return strings.Join(stacks.BackTrace, "\n")
+	stacks := symbol.KsymStackStrsReversed(addrs, perfStackDepth)
+	return strings.Join(stacks, "\n")
 }
 
 func convertLevels(levels []*querierv1.Level) []*flamegraph.Level {
@@ -93,7 +93,7 @@ func parsedata(b bpf.BPF) error {
 		Value uint64
 	}
 
-	u := symbol.NewUsym()
+	u := symbol.NewUsymResolver()
 	for _, v := range items {
 		ed := eventdata{}
 		var count uint64
@@ -141,19 +141,16 @@ func parsedata(b bpf.BPF) error {
 		}
 
 		if kv.Key.UstackSize > 0 {
-			for _, addr := range &kv.Key.Ustack {
-				if addr == 0 {
-					break
-				}
-				usym := u.ResolveUstack(addr, kv.Key.Pid)
-				if usym != "" {
-					index, functionNames = findOrAdd(usym, functionNames)
+			frames := u.UsymStackStrsReversed(kv.Key.Pid, kv.Key.Ustack[:], int(kv.Key.UstackSize))
+			for _, frame := range frames {
+				if frame != "" {
+					index, functionNames = findOrAdd(frame, functionNames)
 					sample.FunctionIds = append(sample.FunctionIds, int32(index))
 				}
 			}
 		}
 
-		sttitle := bytesutil.ToString(kv.Key.Name[:])
+		sttitle := bytesutil.ToStr(kv.Key.Name[:])
 		index, functionNames = findOrAdd(sttitle, functionNames)
 		sample.FunctionIds = append(sample.FunctionIds, int32(index))
 

@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sync"
 
+	"huatuo-bamai/internal/log"
 	"huatuo-bamai/pkg/types"
 )
 
@@ -75,16 +76,18 @@ func NewRegister(blackListed []string) (map[string]*EventTracingAttr, error) {
 				}
 
 				tracingStatusCache[name] = statusInitError
-				err = fmt.Errorf("traing name: %s, err: [%w]", name, err)
+				err = fmt.Errorf("tracing name: %s, err: [%w]", name, err)
 				return
 			}
 			if attr.Flag&(FlagTracing|FlagMetric) == 0 {
-				err = fmt.Errorf("traing name: %s, invalid flag", name)
+				err = fmt.Errorf("tracing name: %s, invalid flag", name)
 				return
 			}
 
 			tracingStatusCache[name] = statusActive
 			tracingMap[name] = attr
+
+			log.Infof("register tracing or metric collector: %s", name)
 		}
 
 		tracingEventAttrCache = tracingMap

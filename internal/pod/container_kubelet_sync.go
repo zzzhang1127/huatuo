@@ -69,11 +69,12 @@ type kubeletConfigz struct {
 	Kubeletconfig kubeletConfiguration `json:"kubeletconfig"`
 }
 
-type PodContainerInitCtx struct {
+type ManagerInitCtx struct {
 	PodReadOnlyPort      uint32
 	PodAuthorizedPort    uint32
 	PodClientCertPath    string
 	PodContainerDisabled bool
+	DockerAPIVersion     string
 
 	// this is used internally.
 	podClientCertPath string
@@ -92,7 +93,7 @@ func kubeletConfigAuthorizedURL(port uint32) string {
 	return fmt.Sprintf("https://127.0.0.1:%d/configz", port)
 }
 
-func kubeletPodListHttpRequest(ctx *PodContainerInitCtx) (*http.Client, error) {
+func kubeletPodListHttpRequest(ctx *ManagerInitCtx) (*http.Client, error) {
 	client := &http.Client{
 		Timeout: kubeletReqTimeout,
 	}
@@ -101,7 +102,7 @@ func kubeletPodListHttpRequest(ctx *PodContainerInitCtx) (*http.Client, error) {
 	return client, err
 }
 
-func kubeletPodListAuthorizationRequest(ctx *PodContainerInitCtx) (*http.Client, error) {
+func kubeletPodListAuthorizationRequest(ctx *ManagerInitCtx) (*http.Client, error) {
 	cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
 	if err != nil {
 		return nil, fmt.Errorf("loading client key pair [%s,%s]: %w",
@@ -122,7 +123,7 @@ func kubeletPodListAuthorizationRequest(ctx *PodContainerInitCtx) (*http.Client,
 	return client, err
 }
 
-func kubeletPodListPortCacheUpdate(ctx *PodContainerInitCtx) error {
+func kubeletPodListPortCacheUpdate(ctx *ManagerInitCtx) error {
 	if client, err := kubeletPodListHttpRequest(ctx); err == nil {
 		kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
 		kubeletPodListClient = client
@@ -143,7 +144,9 @@ func kubeletPodListPortCacheUpdate(ctx *PodContainerInitCtx) error {
 	return nil
 }
 
-func ContainerPodMgrInit(ctx *PodContainerInitCtx) error {
+func ManagerInit(ctx *ManagerInitCtx) error {
+	dockerAPIVersion = ctx.DockerAPIVersion
+
 	// Pod sync disabled, directly return
 	if ctx.PodContainerDisabled {
 		log.Infof("skip pod sync: pod container from kubelet is disabled")
@@ -163,10 +166,11 @@ func ContainerPodMgrInit(ctx *PodContainerInitCtx) error {
 	}
 
 	s := strings.Split(ctx.PodClientCertPath, ",")
+	cert := strings.TrimSpace(s[0])
 	if len(s) == 1 {
-		ctx.podClientCertPath, ctx.podClientCertKey = s[0], s[0]
+		ctx.podClientCertPath, ctx.podClientCertKey = cert, cert
 	} else if len(s) >= 2 {
-		ctx.podClientCertPath, ctx.podClientCertKey = s[0], s[1]
+		ctx.podClientCertPath, ctx.podClientCertKey = cert, strings.TrimSpace(s[1])
 	}
 
 	err := kubeletPodListPortCacheUpdate(ctx)
@@ -195,7 +199,7 @@ func ContainerPodMgrInit(ctx *PodContainerInitCtx) error {
 					log.Infof("kubelet is running now")
 					_ = kubeletConfigCacheUpdate(ctx)
 					_ = containerCgroupCssInit()
-					ContainerPodMgrClose()
+					ManagerRelease()
 					break
 				}
 			case <-doneCtx.Done():
@@ -207,7 +211,7 @@ func ContainerPodMgrInit(ctx *PodContainerInitCtx) error {
 	return nil
 }
 
-func ContainerPodMgrClose() {
+func ManagerRelease() {
 	if kubeletTimeTicker != nil {
 		kubeletTimeTicker.Stop()
 		kubeletTimeTicker = nil
@@ -258,7 +262,8 @@ func kubeletSyncContainers() error {
 			containerStatus := c[1].(*corev1.ContainerStatus)
 			containerID, err := parseContainerIDInPodStatus(containerStatus.ContainerID)
 			if err != nil {
-				return fmt.Errorf("failed to parse container id %s in pod %s status: %w", containerStatus.ContainerID, pod.Name, err)
+				log.Warnf("failed to parse container id %s in pod %s status: %v", containerStatus.ContainerID, pod.Name, err)
+				continue
 			}
 
 			newContainers[containerID] = &containerInfo{
@@ -385,6 +390,12 @@ func kubeletUpdateContainer(containerID string, container *corev1.Container, con
 		return fmt.Errorf("failed to get net namespace inode by pid: %w", err)
 	}
 
+	// net namespace cookie (Linux 5.14+; falls back to 0 on older kernels)
+	netCookie, err := netutil.NetNSCookieByPid(initPid)
+	if err != nil {
+		log.Debugf("failed to get net namespace cookie for pid %d: %v", initPid, err)
+	}
+
 	labels, err := parseContainerLabels(containerType, pod)
 	if err != nil {
 		return fmt.Errorf("failed to parse container labels: %w", err)
@@ -401,26 +412,27 @@ func kubeletUpdateContainer(containerID string, container *corev1.Container, con
 	}
 
 	containers[containerID] = &Container{
-		ID:                containerID,
-		Name:              container.Name,
-		Hostname:          hostname,
-		Type:              containerType,
-		Qos:               containerQos,
-		IPAddress:         parseContainerIPAddress(pod),
-		NetNamespaceInode: nsInode,
-		InitPid:           initPid,
-		CgroupPath:        containerCgroupSuffix(containerID, pod),
-		CgroupCss:         css,
-		StartedAt:         startedAt,
-		SyncedAt:          time.Now(),
-		lifeResouces:      make(map[string]any),
-		Labels:            labels,
+		ID:                 containerID,
+		Name:               container.Name,
+		Hostname:           hostname,
+		Type:               containerType,
+		Qos:                containerQos,
+		IPAddress:          parseContainerIPAddress(pod),
+		NetNamespaceInode:  nsInode,
+		NetNamespaceCookie: netCookie,
+		InitPid:            initPid,
+		CgroupPath:         containerCgroupSuffix(containerID, pod),
+		CgroupCss:          css,
+		StartedAt:          startedAt,
+		SyncedAt:           time.Now(),
+		lifeResources:      make(map[string]any),
+		Labels:             labels,
 	}
 
 	// create container life resources
 	createContainerLifeResources(containers[containerID])
 
-	log.Infof("update container %#v", containers[containerID])
+	log.Debugf("update container %#v", containers[containerID])
 	return nil
 }
 
@@ -434,8 +446,14 @@ func parseContainerIDInPodStatus(data string) (string, error) {
 		return "", fmt.Errorf("invalid container id: %s", data)
 	}
 
-	// init the container provider
-	initContainerProviderEnv(parts[0])
+	provider, err := containerProviderFrom(parts[0])
+	if err != nil {
+		return "", err
+	}
+
+	if err := initContainerProviderEnv(provider, dockerAPIVersion); err != nil {
+		return "", fmt.Errorf("init container provider for containerID %q: %w", data, err)
+	}
 
 	return parts[1], nil
 }
@@ -487,7 +505,7 @@ func kubeletConfigFileDefault() (kubeletConfiguration, error) {
 //
 // CgroupDriver
 // ContainerRuntimeEndpoint
-func kubeletConfigCacheUpdate(ctx *PodContainerInitCtx) error {
+func kubeletConfigCacheUpdate(ctx *ManagerInitCtx) error {
 	var (
 		config kubeletConfiguration
 		err    error
@@ -514,7 +532,10 @@ func kubeletConfigCacheUpdate(ctx *PodContainerInitCtx) error {
 
 	config, err = kubeletConfigFileDefault()
 	if err != nil {
-		panic("we cant not find any cgroup driver of kubelet after requesting configz and default files")
+		panic(fmt.Sprintf(
+			"we cannot find any cgroup driver of kubelet after requesting configz and default files: %v",
+			err,
+		))
 	}
 
 	return nil

@@ -49,7 +49,7 @@ function print_sys_info() {
 	df -h
 
 	# tool chains
-	go version || ture
+	go version || true
 	go env || true
 
 	docker version || true
@@ -99,12 +99,30 @@ function install_golang() {
 function prapre_test_env() {
 	case $OS_DISTRO in
 	ubuntu*)
-		apt update >/dev/null
-		apt install make libbpf-dev clang git gcc jq -y >/dev/null
+		packages=("make" "libbpf-dev" "clang" "git" "gcc" "jq" "capnproto")
+		missing_packages=()
+
+		for pkg in "${packages[@]}"; do
+			if dpkg --status "$pkg" &>/dev/null; then
+				echo "$pkg is already installed."
+			else
+				echo "$pkg is missing."
+				missing_packages+=("$pkg")
+			fi
+		done
+
+		if [ "${#missing_packages[@]}" -gt 0 ]; then
+			echo "installing missing packages: ${missing_packages[*]}"
+			sudo apt-get update
+			sudo apt-get install -y "${missing_packages[@]}"
+		fi
+		# Ubuntu 20.04 Default clang-10 Has a CO-RE Relocation Bug (Fixed in LLVM 12 / D87153) — Use clang-12 Instead
+		[[ "$OS_DISTRO" != "ubuntu20.04" ]] || { sudo apt-get install -y clang-12 && sudo ln -sf /usr/bin/clang-12 /usr/local/bin/clang; }
 		;;
 	esac
 
-	go install github.com/vektra/mockery/v2@latest && which mockery
+	which mockery || go install github.com/vektra/mockery/v2@latest
+	which capnpc-go || go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
 	git config --global --add safe.directory /mnt/host
 }
 
@@ -117,6 +135,8 @@ cd /mnt/host && pwd
 ls -alh /mnt/host
 
 echo -e "\n\n⬅️ test..."
+
+go test -tags=didi -v ./internal/bpf
 
 make test
 

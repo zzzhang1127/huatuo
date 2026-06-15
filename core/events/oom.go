@@ -21,9 +21,10 @@ import (
 	"time"
 
 	"huatuo-bamai/internal/bpf"
+	"huatuo-bamai/internal/log"
 	"huatuo-bamai/internal/pod"
-	"huatuo-bamai/internal/storage"
 	"huatuo-bamai/internal/utils/bytesutil"
+	"huatuo-bamai/internal/utils/kernaddr"
 	"huatuo-bamai/pkg/metric"
 	"huatuo-bamai/pkg/tracing"
 )
@@ -90,7 +91,8 @@ func (c *oomCollector) Update() ([]*metric.Data, error) {
 	metrics = append(metrics, metric.NewCounterData("host_total", outOfMemoryCounterHost, "host oom counter", nil))
 	for _, container := range containers {
 		if val, exists := outOfMemoryCounterContainer[container.ID]; exists {
-			metrics = append(metrics,
+			metrics = append(
+				metrics,
 				metric.NewContainerCounterData(container, "total", float64(val.count), "containers oom counter", map[string]string{"process": val.victimProcessName}),
 			)
 		}
@@ -136,13 +138,13 @@ func (c *oomCollector) Start(ctx context.Context) error {
 
 			cssContainers := pod.BuildCssContainersID(containers, pod.SubSysMemory)
 			oomData := &OOMTracingData{
-				TriggerMemcgCSS:    fmt.Sprintf("0x%x", data.TriggerMemcgCSS),
+				TriggerMemcgCSS:    kernaddr.Format(data.TriggerMemcgCSS),
 				TriggerPid:         data.TriggerPid,
-				TriggerProcessName: bytesutil.ToString(data.TriggerProcessName[:]),
+				TriggerProcessName: bytesutil.ToStr(data.TriggerProcessName[:]),
 				TriggerContainerID: cssContainers[data.TriggerMemcgCSS],
-				VictimMemcgCSS:     fmt.Sprintf("0x%x", data.VictimMemcgCSS),
+				VictimMemcgCSS:     kernaddr.Format(data.VictimMemcgCSS),
 				VictimPid:          data.VictimPid,
-				VictimProcessName:  bytesutil.ToString(data.VictimProcessName[:]),
+				VictimProcessName:  bytesutil.ToStr(data.VictimProcessName[:]),
 				VictimContainerID:  cssContainers[data.VictimMemcgCSS],
 			}
 
@@ -163,7 +165,13 @@ func (c *oomCollector) Start(ctx context.Context) error {
 
 			mutex.Unlock()
 
-			storage.Save("oom", "", time.Now(), oomData)
+			if err := tracing.Save(&tracing.WriteRequest{
+				TracerName: "oom",
+				TracerTime: time.Now(),
+				TracerData: oomData,
+			}); err != nil {
+				log.Warnf("failed to save tracing data: %v", err)
+			}
 		}
 	}
 }

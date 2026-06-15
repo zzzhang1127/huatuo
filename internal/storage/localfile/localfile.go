@@ -1,4 +1,4 @@
-// Copyright 2025 The HuaTuo Authors
+// Copyright 2026 The HuaTuo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,72 +12,113 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package localfile implements a storage backend that appends records to local
+// files with rotation support.
 package localfile
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path"
 	"sync"
 
 	"huatuo-bamai/internal/filerotate"
-	"huatuo-bamai/internal/storage/types"
+	"huatuo-bamai/internal/storage/driver"
 )
 
-type StorageClient struct {
+// Storage appends records to local files. It is bound to one collection by Init.
+type Storage struct {
 	lock         sync.Mutex
 	files        map[string]io.Writer
+	writerCache  sync.Map
 	path         string
 	rotationSize int
 	maxRotation  int
 }
 
-var fileWriterMap sync.Map
+var _ driver.Backend = (*Storage)(nil)
 
-func NewStorageClient(path string, maxRotation, rotationSize int) (*StorageClient, error) {
-	return &StorageClient{
+// init registers the localfile backend driver so it is available via
+// side-effect import.
+func init() {
+	driver.RegisterBackend("localfile", func(cfg *driver.Config) (driver.Backend, error) {
+		return NewBackend(cfg.LocalFilePath, cfg.LocalFileRotationSize, cfg.LocalFileMaxRotation), nil
+	})
+}
+
+// NewBackend creates a local file backend.
+func NewBackend(path string, rotationSize, maxRotation int) *Storage {
+	return &Storage{
 		path:         path,
-		maxRotation:  maxRotation,
 		rotationSize: rotationSize,
+		maxRotation:  maxRotation,
 		files:        make(map[string]io.Writer),
-	}, nil
+	}
 }
 
-// Write the document data into local file.
-func (s *StorageClient) Write(doc *types.Document) error {
-	buffer := &bytes.Buffer{}
-	encoder := json.NewEncoder(buffer)
+func (s *Storage) Init(_ context.Context, _ string, _ []driver.Index) error {
+	return nil
+}
 
-	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "\t")
-
-	if err := encoder.Encode(doc); err != nil {
-		return fmt.Errorf("json Marshal by %s: %w", doc.TracerName, err)
+func (s *Storage) Save(_ context.Context, rec driver.Record) error {
+	filename := tracerFilename(rec)
+	if filename == "" {
+		return driver.ErrInvalidField
 	}
 
-	return s.write(doc.TracerName, buffer.Bytes())
+	data, err := formatDocumentJSON(rec.Data)
+	if err != nil {
+		data = rec.Data
+	}
+	_, err = s.writerByName(filename).Write(data)
+	return err
 }
 
-// newFileWriter create a file rotator
-func (s *StorageClient) newFileWriter(filename string) io.Writer {
-	filepath := path.Join(s.path, filename)
+func (s *Storage) Get(context.Context, string) (driver.Record, error) {
+	return driver.Record{}, driver.ErrUnsupported
+}
 
-	writer, ok := fileWriterMap.Load(filepath)
+func (s *Storage) Delete(context.Context, string) error {
+	return driver.ErrUnsupported
+}
+
+func (s *Storage) Query(context.Context, driver.Query) ([]driver.Record, error) {
+	return nil, driver.ErrUnsupported
+}
+
+func (s *Storage) Count(context.Context, driver.Query) (int64, error) {
+	return 0, driver.ErrUnsupported
+}
+
+func (s *Storage) Values(context.Context, string, driver.Query, int) ([]string, error) {
+	return nil, driver.ErrUnsupported
+}
+
+// Close is a no-op: the file rotator flushes on each Write, so there is
+// nothing buffered to drain at shutdown.
+func (s *Storage) Close(_ context.Context) error {
+	return nil
+}
+
+func (s *Storage) newFileWriter(filename string) io.Writer {
+	fp := path.Join(s.path, filename)
+
+	fileWriter, ok := s.writerCache.Load(fp)
 	if !ok {
-		writer = filerotate.NewFileRotator(filepath, s.maxRotation, s.rotationSize)
-		fileWriterMap.Store(filepath, writer)
+		fileWriter = filerotate.NewFileRotator(fp, s.maxRotation, s.rotationSize)
+		s.writerCache.Store(fp, fileWriter)
 	}
 
-	s.files[filename] = writer.(io.Writer)
+	s.files[filename] = fileWriter.(io.Writer)
 	return s.files[filename]
 }
 
-func (s *StorageClient) writerByName(name string) io.Writer {
-	if writer, ok := s.files[name]; ok {
-		return writer
+func (s *Storage) writerByName(name string) io.Writer {
+	if fileWriter, ok := s.files[name]; ok {
+		return fileWriter
 	}
 
 	s.lock.Lock()
@@ -90,7 +131,19 @@ func (s *StorageClient) writerByName(name string) io.Writer {
 	return s.newFileWriter(name)
 }
 
-func (s *StorageClient) write(name string, content []byte) error {
-	_, err := s.writerByName(name).Write(content)
-	return err
+func tracerFilename(rec driver.Record) string {
+	if rec.Fields != nil {
+		if name, ok := rec.Fields["tracer_name"].(string); ok {
+			return name
+		}
+	}
+	return ""
+}
+
+func formatDocumentJSON(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "\t"); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

@@ -18,14 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
-	"huatuo-bamai/internal/conf"
+	internalconfig "huatuo-bamai/internal/config"
 	"huatuo-bamai/internal/log"
 	"huatuo-bamai/internal/procfs/blockdevice"
-	"huatuo-bamai/internal/storage"
-	"huatuo-bamai/internal/symbol"
 	"huatuo-bamai/pkg/tracing"
 	"huatuo-bamai/pkg/types"
 )
@@ -55,11 +54,11 @@ type IOStatusData struct {
 
 // IOStack records io_schedule backtrace.
 type IOStack struct {
-	Pid               uint32       `json:"pid"`
-	Comm              string       `json:"comm"`
-	ContainerHostname string       `json:"container_hostname"`
-	Latency           uint64       `json:"latency_us"`
-	Stack             symbol.Stack `json:"stack"`
+	Pid               uint32   `json:"pid"`
+	Comm              string   `json:"comm"`
+	ContainerHostname string   `json:"container_hostname"`
+	Latency           uint64   `json:"latency_us"`
+	Stack             []string `json:"stack"`
 }
 
 // ProcFileData records process information.
@@ -199,7 +198,7 @@ func buildDiskMetric(prev, curr *blockdevice.Diskstats, intervalSeconds uint64) 
 	return metrics
 }
 
-func waittingDiskEvents(ctx context.Context, intervalSeconds uint64, thresholds IoThresholds) (*ReasonSnapshot, error) {
+func waitingDiskEvents(ctx context.Context, intervalSeconds uint64, thresholds IoThresholds) (*ReasonSnapshot, error) {
 	lastRawStats := make(map[string]*blockdevice.Diskstats)
 	lastMetrics := make(map[string]DiskStatus)
 	ticker := time.NewTicker(time.Duration(int64(intervalSeconds)) * time.Second)
@@ -254,20 +253,23 @@ func waittingDiskEvents(ctx context.Context, intervalSeconds uint64, thresholds 
 // Start do the io tracer work
 func (c *ioTracing) Start(ctx context.Context) error {
 	thresholds := IoThresholds{
-		RbpsThreshold:  conf.Get().AutoTracing.IOTracing.RbpsThreshold,
-		WbpsThreshold:  conf.Get().AutoTracing.IOTracing.WbpsThreshold,
-		UtilThreshold:  conf.Get().AutoTracing.IOTracing.UtilThreshold,
-		AwaitThreshold: conf.Get().AutoTracing.IOTracing.AwaitThreshold,
+		RbpsThreshold:  cfg.IOTracing.RbpsThreshold,
+		WbpsThreshold:  cfg.IOTracing.WbpsThreshold,
+		UtilThreshold:  cfg.IOTracing.UtilThreshold,
+		AwaitThreshold: cfg.IOTracing.AwaitThreshold,
 	}
 
-	reasonSnapshot, err := waittingDiskEvents(ctx, 5, thresholds)
+	runIotracingToolTimeout := cfg.IOTracing.RunTracingToolTimeout
+
+	reasonSnapshot, err := waitingDiskEvents(ctx, 5, thresholds)
 	if err != nil {
 		return err
 	}
 
 	log.Debugf("wait disk events with reason snapshot: %+v", reasonSnapshot)
 
-	taskID := tracing.NewTask("iotracing", 40*time.Second, tracing.TaskStorageStdout, []string{"--json"})
+	taskID := tracing.NewTask("iotracing", time.Duration(runIotracingToolTimeout)*time.Second,
+		tracing.TaskStorageStdout, []string{"--bpf-path", path.Join(internalconfig.CoreBpfDir, "iotracing.o"), "--json"})
 
 	for {
 		select {
@@ -291,7 +293,14 @@ func (c *ioTracing) Start(ctx context.Context) error {
 					return fmt.Errorf("failed to unmarshal ioStatusData: %w", err)
 				}
 
-				storage.Save("iotracing", "", time.Now(), &ioStatusData)
+				if err := tracing.Save(&tracing.WriteRequest{
+					TracerName:    "iotracing",
+					TracerTime:    time.Now(),
+					TracerData:    &ioStatusData,
+					TracerRunType: tracing.TracerRunTypeAutotracing,
+				}); err != nil {
+					log.Warnf("failed to save tracing data: %v", err)
+				}
 				return nil
 			case tracing.StatusFailed:
 				return result.TaskErr

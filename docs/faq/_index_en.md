@@ -1,5 +1,5 @@
 ---
-title: Frequenty Asked Questions
+title: FAQ
 type: docs
-weight: 7
+weight: 9
 ---

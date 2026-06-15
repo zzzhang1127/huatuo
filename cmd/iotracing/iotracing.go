@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"container/heap"
 	"context"
-	_ "embed"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -42,10 +41,8 @@ import (
 	"huatuo-bamai/pkg/types"
 )
 
-//go:generate $BPF_COMPILE $BPF_INCLUDE -s $BPF_DIR/iotracing.c -o iotracing.o
+//go:generate $BPF_COMPILE $BPF_INCLUDE -s $BPF_DIR/iotracing.c -o $BPF_DIR/iotracing.o
 
-//go:embed iotracing.o
-var iotracing []byte
 var tracingCmd ioTracing
 
 // IOStatusData contains IO status information.
@@ -56,11 +53,11 @@ type IOStatusData struct {
 
 // IOStack records io_schedule backtrace.
 type IOStack struct {
-	Pid               uint32       `json:"pid"`
-	Comm              string       `json:"comm"`
-	ContainerHostname string       `json:"container_hostname"`
-	Latency           uint64       `json:"latency_us"`
-	Stack             symbol.Stack `json:"stack"`
+	Pid               uint32   `json:"pid"`
+	Comm              string   `json:"comm"`
+	ContainerHostname string   `json:"container_hostname"`
+	Latency           uint64   `json:"latency_us"`
+	Stack             []string `json:"stack"`
 }
 
 // ProcFileData records process information.
@@ -118,7 +115,7 @@ type IOData struct {
 
 // IODelayData contains IO schedule info from iodelay_perf_events.
 type IODelayData struct {
-	Stack     [symbol.KsymbolStackMinDepth]uint64
+	Stack     [symbol.KsymStackMinDepth]uint64
 	TimeStamp uint64
 	Cost      uint64
 	StackSize uint32
@@ -131,7 +128,7 @@ type IODelayData struct {
 func (data *IOData) FilePathName() string {
 	names := make([]string, 0, len(data.FilePath))
 	for i := len(data.FilePath) - 1; i >= 0; i-- {
-		s := strings.TrimSpace(bytesutil.ToString(data.FilePath[i][:]))
+		s := strings.TrimSpace(bytesutil.ToStr(data.FilePath[i][:]))
 		if s == "" || s == "/" {
 			continue
 		}
@@ -244,7 +241,7 @@ func parseProcFileTable(pid uint32, files *PriorityQueue) ProcFileData {
 		fileStat = append(fileStat, stat)
 
 		if comm == "" {
-			comm = bytesutil.ToString(data.Comm[:])
+			comm = bytesutil.ToStr(data.Comm[:])
 		}
 	}
 
@@ -489,15 +486,19 @@ func mainAction(ctx *cli.Context) error {
 		return err
 	}
 
-	if err := bpf.InitBpfManager(&bpf.Option{
+	if err := bpf.NewManager(&bpf.Option{
 		KeepaliveTimeout: int(tracingCmd.config.durationSecond),
 	}); err != nil {
 		return fmt.Errorf("init bpf: %w", err)
 	}
-	defer bpf.CloseBpfManager()
+	defer bpf.Close()
 
-	// load bpf
-	b, err := bpf.LoadBpfFromBytes("iotracing.o", iotracing, tracingCmd.filters)
+	bpfBytes, err := os.ReadFile(ctx.String("bpf-path"))
+	if err != nil {
+		return fmt.Errorf("read bpf object: %w", err)
+	}
+
+	b, err := bpf.LoadBpfFromBytes(ctx.String("bpf-path"), bpfBytes, tracingCmd.filters)
 	if err != nil {
 		return fmt.Errorf("load bpf: %w", err)
 	}
@@ -530,11 +531,11 @@ func mainAction(ctx *cli.Context) error {
 			hostname, _ := executil.HostnameByPid(event.Pid)
 
 			stack := IOStack{
-				Comm:              bytesutil.ToString(event.Comm[:]),
+				Comm:              bytesutil.ToStr(event.Comm[:]),
 				ContainerHostname: hostname,
 				Pid:               event.Pid,
 				Latency:           event.Cost / 1000,
-				Stack:             symbol.DumpKernelBackTrace(event.Stack[:], symbol.KsymbolStackMinDepth),
+				Stack:             symbol.KsymStackStrs(event.Stack[:], symbol.KsymStackMinDepth),
 			}
 
 			tracingCmd.ioData.IOStack = append(tracingCmd.ioData.IOStack, stack)
@@ -728,6 +729,11 @@ func main() {
 	app := cli.NewApp()
 	app.Action = mainAction
 	app.Flags = []cli.Flag{
+		&cli.StringFlag{
+			Name:  "bpf-path",
+			Value: "bpf/iotracing.o",
+			Usage: "path to the iotracing BPF object file",
+		},
 		&cli.StringFlag{
 			Name:  "device",
 			Usage: "Filter by device(s) (format: major:minor, multiple devices separated by comma, e.g., 8:0 or 8:0,253:0)",

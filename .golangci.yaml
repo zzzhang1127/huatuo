@@ -6,7 +6,6 @@ linters:
     - gosimple
     - ineffassign # Detects when assignments to existing variables are not used
     - unconvert   # Remove unnecessary type conversions
-    - tenv        # Detects using os.Setenv instead of t.Setenv since Go 1.17
     - dupword     # Checks for duplicate words in the source code
     - gofmt       # Gofmt checks whether code was gofmt-ed
     - bodyclose   # checks whether HTTP response body is closed successfully
@@ -88,13 +87,19 @@ linters-settings:
     excludes:
       - G107
       - G115
+      # G201: SQL string formatting — dynamic queries in the SQLite backend are
+      # constructed from internal field names only, never from user-supplied input.
+      - G201
       - G204
       - G401
       - G501
   exclude-dirs:
-    - pkg/tracing
     - vendor
 issues:
+  # Skip reporting lint issues inside generated files (mock, capnp).
+  # Issues in generated files should be fixed via the generator, not the file itself.
+  # Note: typecheck always compiles generated files regardless of this setting.
+  exclude-generated: true
   # List of regexps of issue texts to exclude.
   #
   # But independently of this option we use default exclude patterns,

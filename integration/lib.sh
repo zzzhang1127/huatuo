@@ -51,30 +51,36 @@ assert_eq() {
 }
 
 # wait_until <timeout> <interval> <description> <function> [args...]
-# Example:
-# wait_until 10 1 "check ready" my_check_func "arg1" "arg2"
+# Returns: 0 on success, 1 on timeout (does not exit script)
 wait_until() {
 	local timeout=$1 interval=$2 desc=$3
 	shift 3
 	local func=$1
 	shift
 
-	if ! declare -f "$func" >/dev/null 2>&1; then
-		fatal "❌ wait_until expects function or command: \"$func\""
+	if ! type -t "$func" >/dev/null 2>&1; then
+		echo "❌ wait_until expects function or command: \"$func\"" >&2
+		return 1
 	fi
 
 	local end=$(($(date +%s) + timeout))
 	local attempt=0
-	while (($(date +%s) < end)); do
+	local ret=0
+
+	while [ "$(date +%s)" -lt "$end" ]; do
+		ret=0
 		attempt=$((attempt + 1))
-		log_info "wait attempt #${attempt}: ${desc}"
-		if "$func" "$@"; then
+		log_info "wait attempt #${attempt}: ${desc}, func/cmd: [${func} ${@}]"
+		"$func" "$@" || ret=$?
+		if [ "$ret" -eq 0 ]; then
 			return 0
 		fi
+
 		sleep "$interval"
 	done
 
-	fatal "❌ timeout waiting for: ${desc} after ${timeout}s"
+	log_error "❌ wait_until timeout: ${desc}, func/cmd: [${func} ${@}]"
+	return 1
 }
 
 # ------------------------------- huatuo-bamai --------------------------------
@@ -87,6 +93,8 @@ huatuo_bamai_start() {
 	log_info "starting huatuo-bamai: ${args[*]}"
 	${HUATUO_BAMAI_BIN} "${args[@]}" >${HUATUO_BAMAI_TEST_TMPDIR}/huatuo.log 2>&1 &
 	HUATUO_BAMAI_PID=$!
+
+	sleep 0.5s
 
 	wait_until "${WAIT_HUATUO_BAMAI_TIMEOUT}" "${WAIT_HUATUO_BAMAI_INTERVAL}" "huatuo-bamai ready" \
 		huatuo_bamai_ready
@@ -121,7 +129,7 @@ huatuo_bamai_pod_count() {
 	local regex=$1
 	curl -sf "${CURL_TIMEOUT[@]}" ${HUATUO_BAMAI_PODS_API} |
 		jq --arg re "$regex" '
-      [ .[]
+      [ .data[]
         | select(.hostname != null)
         | select(.hostname | test($re))
       ] | length
@@ -152,7 +160,6 @@ integration_test_teardown() {
 	local exit_code=$1
 
 	huatuo_bamai_stop || true
-	huatuo_bamai_log_check || true
 
 	# Print details on failure
 	if [ "${exit_code}" -ne 0 ]; then
@@ -173,5 +180,14 @@ Key files:
 
 =========================================================
 "
+	fi
+
+	if ! huatuo_bamai_log_check; then
+		log_error "❌ huatuo-bamai log check failed"
+		exit_code=1
+	fi
+
+	if [ $exit_code -ne 0 ]; then
+		fatal "❌ integration test failed with exit code: ${exit_code}"
 	fi
 }

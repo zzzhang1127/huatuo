@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"huatuo-bamai/internal/bpf"
-	"huatuo-bamai/internal/storage"
+	"huatuo-bamai/internal/log"
 	"huatuo-bamai/internal/utils/bytesutil"
 	"huatuo-bamai/pkg/tracing"
 )
@@ -85,11 +85,17 @@ func (c *txqueueTimeout) Start(ctx context.Context) error {
 
 			data := txqueueTracingData{
 				QueueIndex: event.QueueIndex,
-				Name:       bytesutil.ToString(event.Name[:]),
-				Driver:     bytesutil.ToString(event.Driver[:]),
+				Name:       bytesutil.ToStr(event.Name[:]),
+				Driver:     bytesutil.ToStr(event.Driver[:]),
 			}
 
-			storage.Save("netdev_txqueue_timeout", "", time.Now(), data)
+			if err := tracing.Save(&tracing.WriteRequest{
+				TracerName: "netdev_txqueue_timeout",
+				TracerTime: time.Now(),
+				TracerData: data,
+			}); err != nil {
+				log.Warnf("failed to save tracing data: %v", err)
+			}
 		}
 	}
 }

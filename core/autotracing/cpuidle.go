@@ -27,11 +27,11 @@ import (
 
 	"huatuo-bamai/internal/cgroups"
 	"huatuo-bamai/internal/cgroups/stats"
-	"huatuo-bamai/internal/conf"
+	internalconfig "huatuo-bamai/internal/config"
 	"huatuo-bamai/internal/flamegraph"
 	"huatuo-bamai/internal/log"
+	"huatuo-bamai/internal/matcher"
 	"huatuo-bamai/internal/pod"
-	"huatuo-bamai/internal/storage"
 	"huatuo-bamai/pkg/tracing"
 	"huatuo-bamai/pkg/types"
 )
@@ -43,7 +43,7 @@ func init() {
 var cgroupMgr cgroups.Cgroup
 
 func newCPUIdle() (*tracing.EventTracingAttr, error) {
-	cgroupMgr, _ = cgroups.NewCgroupManager()
+	cgroupMgr, _ = cgroups.NewManager()
 
 	return &tracing.EventTracingAttr{
 		TracingData: &cpuIdleTracing{},
@@ -73,13 +73,13 @@ type containerCPUInfo struct {
 }
 
 type cpuIdleThreshold struct {
-	deltaUser              int64
-	deltaSys               int64
-	deltaTotal             int64
-	usageUser              int64
-	usageSys               int64
-	usageTotal             int64
-	intervalContinuousPerf int64
+	deltaUser       int64
+	deltaSys        int64
+	deltaTotal      int64
+	usageUser       int64
+	usageSys        int64
+	usageTotal      int64
+	intervalTracing int64
 }
 
 // containersCPUIdleMap is the container information
@@ -87,13 +87,17 @@ type containersCPUIdleMap map[string]*containerCPUInfo
 
 var containersCPUIdle = make(containersCPUIdleMap)
 
-func updateContainersCPUIdle() error {
+func updateContainersCPUIdle(f *matcher.ContainerMatcher) error {
 	containers, err := pod.NormalContainers()
 	if err != nil {
 		return err
 	}
 
 	for _, container := range containers {
+		if !f.Match(container) {
+			continue
+		}
+
 		if _, ok := containersCPUIdle[container.ID]; ok {
 			containersCPUIdle[container.ID].path = container.CgroupPath
 			containersCPUIdle[container.ID].alive = true
@@ -125,7 +129,7 @@ func detectCPUIdleContainer(threshold *cpuIdleThreshold) (*containerCPUInfo, err
 
 			log.Debugf("container [%s], usage: %v", container.path, container.nowUsagePercentage)
 
-			if shouldCareThisEvent(container, threshold) {
+			if shouldCareThisCPUIdle(container, threshold) {
 				return container, nil
 			}
 		}
@@ -183,7 +187,8 @@ func updateContainerCpuUsage(container *containerCPUInfo) error {
 			user:  int64(usage.User),
 			sys:   int64(usage.System),
 			total: int64(usage.Usage),
-		}, &container.prevUsage)
+		}, &container.prevUsage,
+	)
 	if delta.total == 0 {
 		container.updateTime = time.Now()
 		return fmt.Errorf("cpu usage no changed")
@@ -201,18 +206,19 @@ func updateContainerCpuUsage(container *containerCPUInfo) error {
 
 	container.deltaUsagePercentage = containerCpuUsageDelta(
 		&container.nowUsagePercentage,
-		&container.prevUsagePercentage)
+		&container.prevUsagePercentage,
+	)
 	container.prevUsagePercentage = container.nowUsagePercentage
 	container.prevUsage = containerCpuUsage(usage)
 	container.updateTime = time.Now()
 	return nil
 }
 
-func shouldCareThisEvent(container *containerCPUInfo, threshold *cpuIdleThreshold) bool {
+func shouldCareThisCPUIdle(container *containerCPUInfo, threshold *cpuIdleThreshold) bool {
 	nowtime := time.Now()
 	intervalContinuousPerf := nowtime.Sub(container.traceTime)
 
-	if int64(intervalContinuousPerf.Seconds()) > threshold.intervalContinuousPerf {
+	if int64(intervalContinuousPerf.Seconds()) > threshold.intervalTracing {
 		if (container.nowUsagePercentage.user > threshold.usageUser &&
 			container.deltaUsagePercentage.user > threshold.deltaUser) ||
 			(container.nowUsagePercentage.sys > threshold.usageSys &&
@@ -233,7 +239,7 @@ func runPerf(parent context.Context, containerId string, timeOut int64) ([]byte,
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, path.Join(tracing.TaskBinDir, "perf"),
-		"--bpf-obj", "cpuidle.o",
+		"--bpf-path", path.Join(internalconfig.CoreBpfDir, "perf.o"),
 		"--container-id", containerId,
 		"--duration", strconv.FormatInt(timeOut, 10))
 
@@ -261,7 +267,15 @@ func buildAndSaveCPUIdleContainer(container *containerCPUInfo, threshold *cpuIdl
 	}
 
 	log.Debugf("cpuidle flamedata %v", tracerData.FlameData)
-	storage.Save("cpuidle", container.id, container.traceTime, &tracerData)
+	if err := tracing.Save(&tracing.WriteRequest{
+		TracerName:    "cpuidle",
+		ContainerID:   container.id,
+		TracerTime:    container.traceTime,
+		TracerData:    &tracerData,
+		TracerRunType: tracing.TracerRunTypeAutotracing,
+	}); err != nil {
+		log.Warnf("failed to save tracing data: %v", err)
+	}
 	return nil
 }
 
@@ -282,17 +296,22 @@ type CPUIdleTracingData struct {
 }
 
 func (c *cpuIdleTracing) Start(ctx context.Context) error {
-	interval := conf.Get().AutoTracing.CPUIdle.Interval
-	perfRunTimeOut := conf.Get().AutoTracing.CPUIdle.PerfRunTimeOut
+	interval := cfg.CPUIdle.Interval
+	perfRunTimeOut := cfg.CPUIdle.RunTracingToolTimeout
 
 	threshold := &cpuIdleThreshold{
-		deltaUser:              conf.Get().AutoTracing.CPUIdle.DeltaUserThreshold,
-		deltaSys:               conf.Get().AutoTracing.CPUIdle.DeltaSysThreshold,
-		deltaTotal:             conf.Get().AutoTracing.CPUIdle.DeltaUsageThreshold,
-		usageUser:              conf.Get().AutoTracing.CPUIdle.UserThreshold,
-		usageSys:               conf.Get().AutoTracing.CPUIdle.SysThreshold,
-		usageTotal:             conf.Get().AutoTracing.CPUIdle.UsageThreshold,
-		intervalContinuousPerf: conf.Get().AutoTracing.CPUIdle.IntervalContinuousRun,
+		deltaUser:       cfg.CPUIdle.DeltaUserThreshold,
+		deltaSys:        cfg.CPUIdle.DeltaSysThreshold,
+		deltaTotal:      cfg.CPUIdle.DeltaUsageThreshold,
+		usageUser:       cfg.CPUIdle.UserThreshold,
+		usageSys:        cfg.CPUIdle.SysThreshold,
+		usageTotal:      cfg.CPUIdle.UsageThreshold,
+		intervalTracing: cfg.CPUIdle.IntervalTracing,
+	}
+
+	containerFilter, err := cfg.CPUIdle.Filter.Build()
+	if err != nil {
+		return fmt.Errorf("container filter: %w", err)
 	}
 
 	for {
@@ -300,7 +319,7 @@ func (c *cpuIdleTracing) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return types.ErrExitByCancelCtx
 		case <-time.After(time.Duration(interval) * time.Second):
-			if err := updateContainersCPUIdle(); err != nil {
+			if err := updateContainersCPUIdle(containerFilter); err != nil {
 				return err
 			}
 

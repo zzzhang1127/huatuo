@@ -15,118 +15,259 @@
 package events
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
 	"huatuo-bamai/internal/bpf"
 	"huatuo-bamai/internal/log"
-	"huatuo-bamai/internal/storage"
 	"huatuo-bamai/pkg/metric"
 	"huatuo-bamai/pkg/tracing"
+
+	"github.com/cloudflare/backoff"
 )
 
 //go:generate $BPF_COMPILE $BPF_INCLUDE -s $BPF_DIR/ras.c -o $BPF_DIR/ras.o
-type rasTracing struct {
-	count uint64
+
+// Hardware error type identifiers — must stay in sync with bpf/ras.c.
+const (
+	HW_ERR_MCE       = 0
+	HW_ERR_EDAC      = 1
+	HW_ERR_ACPI_GHES = 2
+	HW_ERR_PCIE_AER  = 3
+	HW_ERR_THR       = 4 // MCE threshold (local-APIC) interrupt
+)
+
+// maxNumHWErrTypes is the total number of distinct hardware error source types.
+// Any new HW_ERR_* constant must increment this value and extend hwErrTypeLabels.
+const maxNumHWErrTypes = 5
+
+// hwErrTypeLabels maps each HW_ERR_* index to its Prometheus "type" label value.
+// Index must align 1:1 with the HW_ERR_* constants above.
+var hwErrTypeLabels = [maxNumHWErrTypes]string{
+	HW_ERR_MCE:       "mce",
+	HW_ERR_EDAC:      "edac",
+	HW_ERR_ACPI_GHES: "acpi",
+	HW_ERR_PCIE_AER:  "aer",
+	HW_ERR_THR:       "thr",
 }
 
+const labelType = "type"
+
+// Error severity labels written into RasTracingData.ErrType.
 const (
-	HW_ERR_MCE          = 0
-	HW_ERR_EDAC         = 1
-	HW_ERR_NON_STANDARD = 2
-	HW_ERR_AER_EVENT    = 3
+	ErrTypeCorrected              = "Corrected"
+	ErrTypeUncorrectedRecoverable = "UncorrectedRecoverable"
+	ErrTypeUncorrectedDeferred    = "UncorrectedDeferred"
+	ErrTypeUncorrectedFatal       = "UncorrectedFatal"
+	ErrTypeInfo                   = "Info"
+	ErrTypeUnknown                = "unknown"
 )
 
-var (
-	Corrected   = "CORRECTED"
-	Uncorrected = "UNCORRECTED"
-	RecovPanic  = "RECOVERABLE/PANIC"
-	Fatal       = "FATAL"
-)
-
-// The dynamic_array info is just at the very last place of the event
-// struct. We don't know the exact length of the info because it depends
-// on the driver. Just read the whole 512 bytes of the perf event output
-// Info.
+// The dynamic_array info always lives at the very end of each tracepoint
+// event struct.  We read the full 512-byte buffer so the kernel never needs
+// to truncate the payload.
 //
-// The length of the other part besids data[] are:
-// struct trace_event_raw_mc_event: 64 - 4 = 60
-// struct trace_event_raw_non_standard_event: 60 - 4 = 56
-// struct trace_event_raw_aer_event: 40 - 4 = 36
+// Fixed-portion byte counts (the static fields, excluding the 4-byte
+// __data_loc field that precedes the dynamic area):
+//
+//	trace_event_raw_mc_event:           64 − 4 = 60
+//	trace_event_raw_non_standard_event: 60 − 4 = 56
+//	trace_event_raw_aer_event:          40 − 4 = 36
 const (
-	RAS_PERFEVENT_INFO_SIZE       = 512
-	DETAIL_INFO_SIZE_EDAC         = RAS_PERFEVENT_INFO_SIZE - 60
-	DETAIL_INFO_SIZE_NON_STANDARD = RAS_PERFEVENT_INFO_SIZE - 56
-	DETAIL_INFO_SIZE_AER          = RAS_PERFEVENT_INFO_SIZE - 36
+	RAS_PERFEVENT_INFO_SIZE = 512
+	DETAIL_INFO_SIZE_EDAC   = RAS_PERFEVENT_INFO_SIZE - 60
+	DETAIL_INFO_SIZE_ACPI   = RAS_PERFEVENT_INFO_SIZE - 56
+	DETAIL_INFO_SIZE_AER    = RAS_PERFEVENT_INFO_SIZE - 36
 )
 
-type rasPerfEvent struct {
+// rasEvent mirrors the BPF-side struct event layout.
+type rasEvent struct {
 	Type      uint32
-	Corrected uint32
+	Pad0      uint32
 	Timestamp uint64
 	Info      [RAS_PERFEVENT_INFO_SIZE]byte
 }
 
+// RasTracingData is the structured record persisted by tracing.Save.
 type RasTracingData struct {
 	Device    string `json:"dev"`
 	Event     string `json:"event"`
-	ErrType   string `json:"errtype"`
+	ErrType   string `json:"type"`
 	Timestamp uint64 `json:"timestamp"`
 	Info      string `json:"info"`
 }
 
-var (
-	interruptsPath        = "/proc/interrupts"
-	thresholdCount uint64 = 0
-)
+const defaultThrEventBackoff = 30 * time.Minute
+
+type rasTracing struct {
+	counts     [maxNumHWErrTypes]atomic.Uint64
+	thrBackoff *backoff.Backoff // THR event save cooldown
+}
 
 func init() {
 	tracing.RegisterEventTracing("ras", newRasTracing)
 }
 
 func newRasTracing() (*tracing.EventTracingAttr, error) {
+	backoffDur := defaultThrEventBackoff
+	if cfg.Ras.MceThrBackoff > 0 {
+		backoffDur = time.Duration(cfg.Ras.MceThrBackoff) * time.Second
+	}
+
+	// max == interval so Duration() always returns a flat, non-exponential value.
+	thrBO := backoff.NewWithoutJitter(backoffDur, backoffDur)
+	thrBO.SetDecay(backoffDur)
+
 	return &tracing.EventTracingAttr{
-		TracingData: &rasTracing{},
+		TracingData: &rasTracing{thrBackoff: thrBO},
 		Interval:    60,
 		Flag:        tracing.FlagTracing | tracing.FlagMetric,
 	}, nil
 }
 
-func CopyFromOffset(src []byte, offset, length int) ([]byte, error) {
-	if offset < 0 || offset >= len(src) {
-		return nil, fmt.Errorf("offset out of bounds")
+func decodePayload[T any](info []byte) (*T, error) {
+	var payload T
+	if err := binary.Read(bytes.NewReader(info), binary.LittleEndian, &payload); err != nil {
+		return nil, err
 	}
-	if length <= 0 || offset+length > len(src) {
-		return nil, fmt.Errorf("invalid length parameter")
-	}
-
-	dst := make([]byte, length)
-	if n := copy(dst, src[offset:offset+length]); n != length {
-		return nil, fmt.Errorf("incomplete copy")
-	}
-	return dst, nil
+	return &payload, nil
 }
 
+func cstring(buf []byte, rawOffset, base uint32) string {
+	absOff := rawOffset & 0xffff
+	if absOff < base {
+		return ""
+	}
+	off := int(absOff - base)
+	if off >= len(buf) {
+		return ""
+	}
+	if end := bytes.IndexByte(buf[off:], 0); end >= 0 {
+		return string(buf[off : off+end])
+	}
+	return string(buf[off:])
+}
+
+// Bank's MCi_STATUS MSR
+//
+// #define MCI_STATUS_DEFERRED     BIT_ULL(44)  /* uncorrected error, deferred exception */
+// #define MCI_STATUS_UC           BIT_ULL(61)  /* uncorrected error */
+
 const (
-	// Correctable errors status
-	PciErrCorRcvr     uint32 = 0x00000001 /* Receiver Error Status */
-	PciErrCorBadTlp   uint32 = 0x00000040 /* Bad TLP Status */
-	PciErrCorBadDllp  uint32 = 0x00000080 /* Bad DLLP Status */
+	MCI_STATUS_DEFERRED = 1 << 44
+	MCI_STATUS_UC       = 1 << 61
+)
+
+func mceErrType(status uint64) string {
+	if status&MCI_STATUS_DEFERRED != 0 {
+		return ErrTypeUncorrectedDeferred
+	}
+	if status&MCI_STATUS_UC != 0 {
+		return ErrTypeUncorrectedRecoverable
+	}
+	return ErrTypeCorrected
+}
+
+// copy from linux kernel include/linux/edac.h
+//
+//   - enum hw_event_mc_err_type - type of the detected error
+//   - @HW_EVENT_ERR_CORRECTED:     Corrected Error
+//   - @HW_EVENT_ERR_UNCORRECTED:   Uncorrected Error (non-fatal)
+//   - @HW_EVENT_ERR_DEFERRED:      Deferred Error (uncorrectable but not urgent)
+//   - @HW_EVENT_ERR_FATAL:         Fatal Error (uncorrectable, unrecoverable)
+//   - @HW_EVENT_ERR_INFO:          Informational (CPER informational logs)
+func edacErrType(errType uint32) string {
+	switch errType {
+	case 0x0:
+		return ErrTypeCorrected
+	case 0x01:
+		return ErrTypeUncorrectedRecoverable
+	case 0x02:
+		return ErrTypeUncorrectedDeferred
+	case 0x03:
+		return ErrTypeUncorrectedFatal
+	case 0x04:
+		return ErrTypeInfo
+	default:
+		return ErrTypeUnknown
+	}
+}
+
+// acpiErrType maps an ACPI non-standard event severity to an error type.
+//
+// linux kernel include/acpi/ghes.h
+//
+//	enum {
+//	        GHES_SEV_NO = 0x0,
+//	        GHES_SEV_CORRECTED = 0x1,
+//	        GHES_SEV_RECOVERABLE = 0x2,
+//	        GHES_SEV_PANIC = 0x3,
+//	};
+//
+// ghes_edac_report_mem_error()
+//
+// GHES_SEV_CORRECTED  → HW_EVENT_ERR_CORRECTED
+// GHES_SEV_RECOVERABLE → HW_EVENT_ERR_UNCORRECTED
+// GHES_SEV_PANIC      → HW_EVENT_ERR_FATAL
+// GHES_SEV_NO         → HW_EVENT_ERR_INFO
+func acpiErrType(sev uint8) string {
+	switch sev {
+	case 0x0:
+		return ErrTypeInfo
+	case 0x1:
+		return ErrTypeCorrected
+	case 0x2:
+		return ErrTypeUncorrectedRecoverable
+	case 0x3:
+		return ErrTypeUncorrectedFatal
+	default:
+		return ErrTypeUnknown
+	}
+}
+
+// aerErrType maps a PCIe AER severity value to an error type.
+//
+// linux kernel include/linux/aer.h
+//
+// AER_CORRECTABLE 2
+// AER_FATAL 1
+// AER_NONFATAL 0
+func aerErrType(severity uint8) string {
+	switch severity {
+	case 2:
+		return ErrTypeCorrected
+	case 1:
+		return ErrTypeUncorrectedFatal
+	case 0:
+		return ErrTypeUncorrectedRecoverable
+	default:
+		return ErrTypeUnknown
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PCI AER error status bits (PCIe Base Spec §7.8.4)
+// ---------------------------------------------------------------------------
+
+// Correctable error status bits.
+const (
+	PciErrCorRcvr     uint32 = 0x00000001 /* Receiver Error */
+	PciErrCorBadTlp   uint32 = 0x00000040 /* Bad TLP */
+	PciErrCorBadDllp  uint32 = 0x00000080 /* Bad DLLP */
 	PciErrCorRepRoll  uint32 = 0x00000100 /* REPLAY_NUM Rollover */
 	PciErrCorRepTimer uint32 = 0x00001000 /* Replay Timer Timeout */
 	PciErrCorAdvNfat  uint32 = 0x00002000 /* Advisory Non-Fatal */
 	PciErrCorInternal uint32 = 0x00004000 /* Corrected Internal */
 	PciErrCorLogOver  uint32 = 0x00008000 /* Header Log Overflow */
+)
 
-	// Uncorrectable errors status
+// Uncorrectable error status bits.
+const (
 	PciErrUncUnd       uint32 = 0x00000001 /* Undefined */
 	PciErrUncDlp       uint32 = 0x00000010 /* Data Link Protocol */
 	PciErrUncSurpdn    uint32 = 0x00000020 /* Surprise Down */
@@ -137,20 +278,20 @@ const (
 	PciErrUncUnxComp   uint32 = 0x00010000 /* Unexpected Completion */
 	PciErrUncRxOver    uint32 = 0x00020000 /* Receiver Overflow */
 	PciErrUncMalfTlp   uint32 = 0x00040000 /* Malformed TLP */
-	PciErrUncEcrc      uint32 = 0x00080000 /* ECRC Error Status */
+	PciErrUncEcrc      uint32 = 0x00080000 /* ECRC Error */
 	PciErrUncUnsup     uint32 = 0x00100000 /* Unsupported Request */
 	PciErrUncAscv      uint32 = 0x00200000 /* ACS Violation */
-	PciErrUncIntn      uint32 = 0x00400000 /* internal error */
-	PciErrUncMcptlp    uint32 = 0x00800000 /* MC blocked TLP */
-	PciErrUncAtomeg    uint32 = 0x01000000 /* Atomic egress blocked */
-	PciErrUncTlpPre    uint32 = 0x02000000 /* TLP prefix blocked */
+	PciErrUncIntn      uint32 = 0x00400000 /* Uncorrectable Internal */
+	PciErrUncMcptlp    uint32 = 0x00800000 /* MC Blocked TLP */
+	PciErrUncAtomeg    uint32 = 0x01000000 /* AtomicOp Egress Blocked */
+	PciErrUncTlpPre    uint32 = 0x02000000 /* TLP Prefix Blocked */
 )
 
-var aerCorrectablErrors = map[uint32]string{
+var aerCorrectableErrors = map[uint32]string{
 	PciErrCorRcvr:     "Receiver Error",
 	PciErrCorBadTlp:   "Bad TLP",
-	PciErrCorBadDllp:  "PciErrCorBadDllp",
-	PciErrCorRepRoll:  "RELAY_NUM Rollover",
+	PciErrCorBadDllp:  "Bad DLLP",
+	PciErrCorRepRoll:  "REPLAY_NUM Rollover",
 	PciErrCorRepTimer: "Replay Timer Timeout",
 	PciErrCorAdvNfat:  "Advisory Non-Fatal Error",
 	PciErrCorInternal: "Corrected Internal Error",
@@ -177,21 +318,246 @@ var aerUncorrectableErrors = map[uint32]string{
 	PciErrUncTlpPre:    "TLP Prefix Blocked Error",
 }
 
-func getPciErr(key uint32, isCorrectable bool) (string, error) {
-	if isCorrectable {
-		if val, exists := aerCorrectablErrors[key]; exists {
-			return val, nil
-		}
-	} else {
-		if val, exists := aerUncorrectableErrors[key]; exists {
-			return val, nil
-		}
+func pciErrReason(status uint32, correctable bool) string {
+	m := aerUncorrectableErrors
+	if correctable {
+		m = aerCorrectableErrors
 	}
-
-	return "", fmt.Errorf("key not found")
+	if name, ok := m[status]; ok {
+		return name
+	}
+	return "unknown"
 }
 
-func (ras *rasTracing) Start(ctx context.Context) (err error) {
+func newRasTracingData[T any](ev *rasEvent, device, event, errType string, info T) (*RasTracingData, error) {
+	b, err := json.Marshal(info)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s info: %w", event, err)
+	}
+	return &RasTracingData{
+		Timestamp: ev.Timestamp,
+		Device:    device,
+		Event:     event,
+		ErrType:   errType,
+		Info:      string(b),
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Per-event-type builder functions
+// ---------------------------------------------------------------------------
+
+func buildRasMceTracerData(data *rasEvent) (*RasTracingData, error) {
+	// tracepointMcePayload mirrors struct trace_event_raw_mce_record.
+	// https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git/tree/arch/x86/include/uapi/asm/mce.h
+	type tracepointMcePayload struct {
+		Pad       uint64 `json:"-"`
+		Mcgcap    uint64 `json:"mcg_cpu_cap"`
+		McgStatus uint64 `json:"mcg_msr_status"`
+		Status    uint64 `json:"banks_msr_status"`
+		Addr      uint64 `json:"banks_msr_addr"`
+		Misc      uint64 `json:"banks_msr_misc"`
+		Synd      uint64 `json:"mca_synd_msr"`
+		Ipid      uint64 `json:"mca_ipid_msr"`
+		Ip        uint64 `json:"instr_pointer"`
+		Tsc       uint64 `json:"tsc_timestamp"`
+		Walltime  uint64 `json:"walltime"`
+		Cpu       uint32 `json:"cpu"`
+		Cpuid     uint32 `json:"cpuid"`
+		Apicid    uint32 `json:"apicid"`
+		Socketid  uint32 `json:"socketid"`
+		Cs        uint8  `json:"code_seg"`
+		Bank      uint8  `json:"bank"`
+		Cpuvendor uint8  `json:"cpuvendor"`
+	}
+
+	payload, err := decodePayload[tracepointMcePayload](data.Info[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse MCE payload: %w", err)
+	}
+	return newRasTracingData(data, "CPU/MEM", "MCE", mceErrType(payload.Status), payload)
+}
+
+func buildRasEdacTracerData(data *rasEvent) (*RasTracingData, error) {
+	// tracepointEdacPayload mirrors struct trace_event_raw_mc_event.
+	type tracepointEdacPayload struct {
+		Pad            uint64
+		ErrType        uint32
+		ErrorMsgOffset uint32
+		LabelOffset    uint32
+		ErrCount       uint16
+		McIndex        uint8
+		TopLayer       int8
+		MidLayer       int8
+		LowLayer       int8
+		ReserveA       [6]uint8
+		Addr           uint64
+		GrainBits      uint8
+		ReserveB       [7]uint8
+		Syndrome       uint64
+		DriverDetail   uint32
+		MsgDetail      [DETAIL_INFO_SIZE_EDAC]byte
+	}
+
+	payload, err := decodePayload[tracepointEdacPayload](data.Info[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse EDAC payload: %w", err)
+	}
+
+	const edacBase uint32 = 60
+	dyn := payload.MsgDetail[:]
+	errType := edacErrType(payload.ErrType)
+
+	return newRasTracingData(data, "MEM", "EDAC", errType, struct {
+		ErrCount uint16 `json:"err_count"`
+		ErrType  string `json:"err_type"`
+		Msg      string `json:"err_msg"`
+		Label    string `json:"label"`
+		McIndex  uint8  `json:"mc_index"`
+		TopLayer int8   `json:"top_layer"`
+		MidLayer int8   `json:"mid_layer"`
+		LowLayer int8   `json:"low_layer"`
+		Addr     uint64 `json:"addr"`
+		Grain    uint64 `json:"grain"`
+		Syndrome uint64 `json:"syndrome"`
+		Driver   string `json:"driver"`
+	}{
+		ErrCount: payload.ErrCount,
+		ErrType:  errType,
+		Msg:      cstring(dyn, payload.ErrorMsgOffset, edacBase),
+		Label:    cstring(dyn, payload.LabelOffset, edacBase),
+		McIndex:  payload.McIndex,
+		TopLayer: payload.TopLayer,
+		MidLayer: payload.MidLayer,
+		LowLayer: payload.LowLayer,
+		Addr:     payload.Addr,
+		Grain:    uint64(1) << payload.GrainBits,
+		Syndrome: payload.Syndrome,
+		Driver:   cstring(dyn, payload.DriverDetail, edacBase),
+	})
+}
+
+func buildRasAcpiTracerData(data *rasEvent) (*RasTracingData, error) {
+	// tracepointAcpiNonStandardPayload mirrors
+	// struct trace_event_raw_non_standard_event.
+	type tracepointAcpiNonStandardPayload struct {
+		Pad          uint64
+		SecType      [16]uint8
+		FruID        [16]uint8
+		FruTxtOffset uint32
+		Sev          uint8
+		Pattern      [3]uint8
+		Len          uint32
+		BufOffset    uint32
+		Msg          [DETAIL_INFO_SIZE_ACPI]byte
+	}
+
+	payload, err := decodePayload[tracepointAcpiNonStandardPayload](data.Info[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse ACPI non-standard payload: %w", err)
+	}
+
+	const nonStandardBase uint32 = 56
+	fru := cstring(payload.Msg[:], payload.FruTxtOffset, nonStandardBase)
+
+	// Extract raw bytes at the FRU text location for the hex dump.
+	var rawData []byte
+	if absOff := payload.FruTxtOffset & 0xffff; absOff >= nonStandardBase {
+		rawData = bytes.Clone(payload.Msg[absOff-nonStandardBase : absOff-nonStandardBase+payload.Len])
+	}
+
+	return newRasTracingData(data, "ACPI", "NON_STANDARD", acpiErrType(payload.Sev), struct {
+		Severity uint8  `json:"severity"`
+		SecType  string `json:"sec_type"`
+		FruID    string `json:"fru_id"`
+		FruText  string `json:"fru_text"`
+		DataLen  uint32 `json:"data_len"`
+		RawData  string `json:"raw_data"`
+	}{
+		Severity: payload.Sev,
+		SecType:  fmt.Sprintf("%x", payload.SecType),
+		FruID:    fmt.Sprintf("%x", payload.FruID),
+		FruText:  fru,
+		DataLen:  payload.Len,
+		RawData:  fmt.Sprintf("% x", rawData),
+	})
+}
+
+func buildRasAerTracerData(data *rasEvent) (*RasTracingData, error) {
+	// tracepointAerEventPayload mirrors struct trace_event_raw_aer_event.
+	type tracepointAerEventPayload struct {
+		Pad            uint64
+		DevNameOffset  uint32 // __data_loc_dev_name
+		Status         uint32
+		Severity       uint8
+		TlpHeaderValid uint8
+		Pattern        [2]uint8
+		TlpHeader      [4]uint32
+		Msg            [DETAIL_INFO_SIZE_AER]byte
+	}
+
+	payload, err := decodePayload[tracepointAerEventPayload](data.Info[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse PCIe AER payload: %w", err)
+	}
+
+	const aerBase uint32 = 36
+	dev := cstring(payload.Msg[:], payload.DevNameOffset, aerBase)
+
+	errType := aerErrType(payload.Severity)
+	errReason := pciErrReason(payload.Status, payload.Severity == 2)
+
+	tlpHeader := "not available"
+	if payload.TlpHeaderValid != 0 {
+		tlpHeader = fmt.Sprintf("{%#x,%#x,%#x,%#x}",
+			payload.TlpHeader[0], payload.TlpHeader[1],
+			payload.TlpHeader[2], payload.TlpHeader[3])
+	}
+
+	return newRasTracingData(data, "PCIe "+dev, "AER", errType, struct {
+		DevName   string `json:"dev_name"`
+		ErrType   string `json:"err_type"`
+		ErrReason string `json:"err_reason"`
+		TlpHeader string `json:"tlp_header"`
+	}{
+		DevName:   dev,
+		ErrType:   errType,
+		ErrReason: errReason,
+		TlpHeader: tlpHeader,
+	})
+}
+
+func buildRasThrTracerData(data *rasEvent) (*RasTracingData, error) {
+	// tracepointThrPayload mirrors BPF-side struct thr_info stored in event->info.
+	type tracepointThrPayload struct {
+		Vector uint32 `json:"vector"`
+		CPU    uint32 `json:"cpu"`
+	}
+	payload, err := decodePayload[tracepointThrPayload](data.Info[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse THR payload: %w", err)
+	}
+	return newRasTracingData(data, "CPU", "MCE_THRESHOLD", ErrTypeCorrected, payload)
+}
+
+func dispatchRasTracerData(data *rasEvent) (*RasTracingData, error) {
+	switch data.Type {
+	case HW_ERR_MCE:
+		return buildRasMceTracerData(data)
+	case HW_ERR_EDAC:
+		return buildRasEdacTracerData(data)
+	case HW_ERR_ACPI_GHES:
+		return buildRasAcpiTracerData(data)
+	case HW_ERR_PCIE_AER:
+		return buildRasAerTracerData(data)
+	case HW_ERR_THR:
+		return buildRasThrTracerData(data)
+	default:
+		return nil, fmt.Errorf("unsupported hardware error type %d", data.Type)
+	}
+}
+
+func (ras *rasTracing) Start(ctx context.Context) error {
 	b, err := bpf.LoadBpf(bpf.ThisBpfOBJ(), nil)
 	if err != nil {
 		return fmt.Errorf("load bpf: %w", err)
@@ -203,328 +569,66 @@ func (ras *rasTracing) Start(ctx context.Context) (err error) {
 
 	reader, err := b.AttachAndEventPipe(childCtx, "ras_event_map", 8192)
 	if err != nil {
-		return fmt.Errorf("attach and event pipe: %w", err)
+		return fmt.Errorf("attach ras event pipe: %w", err)
 	}
 	defer reader.Close()
 
-	thresholdCount, err = getThrInfo()
-	if err != nil {
-		return err
-	}
+	b.WaitDetachByBreaker(childCtx, cancel)
+
+	return ras.rasEventLoop(childCtx, reader)
+}
+
+func (ras *rasTracing) rasEventLoop(ctx context.Context, reader bpf.PerfEventReader) error {
+	var nextThrAllowed time.Time
 
 	for {
 		select {
-		case <-childCtx.Done():
-			log.Info("ras tracing is stopped.")
+		case <-ctx.Done():
 			return nil
 		default:
-			var data rasPerfEvent
-			if err := reader.ReadInto(&data); err != nil {
-				return fmt.Errorf("read ras perf event fail: %w", err)
+			var ev rasEvent
+			if err := reader.ReadInto(&ev); err != nil {
+				return fmt.Errorf("read ras event: %w", err)
 			}
 
-			atomic.AddUint64(&ras.count, 1)
-			tracerData := &RasTracingData{
-				Timestamp: data.Timestamp,
+			if int(ev.Type) < maxNumHWErrTypes {
+				ras.counts[ev.Type].Add(1)
 			}
 
-			switch data.Type {
-			case HW_ERR_MCE:
-				tracerData.Device = "CPU/MEM"
-				tracerData.Event = "MCE"
-				if data.Corrected == 0 {
-					tracerData.ErrType = Uncorrected
-				} else {
-					tracerData.ErrType = Corrected
+			// THR: backoff to suppress interrupt storms.
+			if ev.Type == HW_ERR_THR {
+				now := time.Now()
+				if now.Before(nextThrAllowed) {
+					continue
 				}
-
-				type tpMceRecord struct {
-					Pad       uint64
-					Mcgcap    uint64
-					McgStatus uint64
-					Status    uint64
-					Addr      uint64
-					Misc      uint64
-					Synd      uint64
-					Ipid      uint64
-					Ip        uint64
-					Tsc       uint64
-					Walltime  uint64
-					Cpu       uint32
-					Cpuid     uint32
-					Apicid    uint32
-					Socketid  uint32
-					Cs        uint8
-					Bank      uint8
-					Cpuvendor uint8
-				}
-				mceRecord := &tpMceRecord{}
-
-				reader := bytes.NewReader(data.Info[:])
-				err := binary.Read(reader, binary.LittleEndian, mceRecord)
-				if err != nil {
-					return fmt.Errorf("parse mce detail info error: %w", err)
-				}
-
-				tracerData.Info = fmt.Sprintf("CPU: %d, MCGc/s: %x/%x, MC%d: %016x, "+
-					"IPID: %016x, ADDR/MISC/SYND: %016x/%016x/%016x, "+
-					"RIP: %02x:<%016x>, TSC: %x, PROCESSOR: %x:%x, "+
-					"TIME: %d, SOCKET: %x, APIC: %x",
-					mceRecord.Cpu, mceRecord.Mcgcap, mceRecord.McgStatus,
-					mceRecord.Bank, mceRecord.Status,
-					mceRecord.Ipid, mceRecord.Addr, mceRecord.Misc,
-					mceRecord.Synd, mceRecord.Cs, mceRecord.Ip,
-					mceRecord.Tsc, mceRecord.Cpuvendor,
-					mceRecord.Cpuid, mceRecord.Walltime,
-					mceRecord.Socketid, mceRecord.Apicid)
-
-			case HW_ERR_EDAC:
-				tracerData.Device = "MEM"
-				tracerData.Event = "EDAC"
-				if data.Corrected == 0 {
-					tracerData.ErrType = Uncorrected
-				} else {
-					tracerData.ErrType = Corrected
-				}
-
-				type tpEdacRecord struct {
-					Pad            uint64
-					ErrType        uint32
-					ErrorMsgOffset uint32
-					LabelOffset    uint32
-					ErrCount       uint16
-					McIndex        uint8
-					TopLayer       int8
-					MidLayer       int8
-					LowLayer       int8
-					ReserveA       [6]uint8
-					Addr           uint64
-					GrainBits      uint8
-					ReserveB       [7]uint8
-					Syndrome       uint64
-					DriverDetail   uint32
-					MsgDetail      [DETAIL_INFO_SIZE_EDAC]byte
-				}
-
-				edacRecord := &tpEdacRecord{}
-
-				reader := bytes.NewReader(data.Info[:])
-				err := binary.Read(reader, binary.LittleEndian, edacRecord)
-				if err != nil {
-					return fmt.Errorf("parse edac detail info error: %w", err)
-				}
-
-				msgDetail := edacRecord.MsgDetail[:]
-
-				// Get the detailed message string base on the offsets
-				// Error message
-				errMsgOffset := edacRecord.ErrorMsgOffset&0xffff - 60
-				strErrorMsgEnd := bytes.IndexByte(msgDetail[errMsgOffset:], 0)
-				strErrorMsg := string(msgDetail[errMsgOffset : int(errMsgOffset)+strErrorMsgEnd])
-
-				// Label
-				labelOffset := edacRecord.LabelOffset&0xffff - 60
-				strLabelEnd := bytes.IndexByte(msgDetail[labelOffset:], 0)
-				strLabel := string(msgDetail[labelOffset : int(labelOffset)+strLabelEnd])
-
-				// Driver detail info
-				driverDetail := edacRecord.DriverDetail&0xffff - 60
-				strDriverDetailEnd := bytes.IndexByte(msgDetail[driverDetail:], 0)
-				strDriverDetail := string(msgDetail[driverDetail : int(driverDetail)+strDriverDetailEnd])
-
-				tracerData.Info = fmt.Sprintf("%d %s err: %s on %s "+
-					"(mc: %d location:%d:%d:%d "+
-					"address: %#x grain:%d syndrome:%#x %s)",
-					edacRecord.ErrCount,
-					tracerData.ErrType,
-					strErrorMsg,
-					strLabel,
-					edacRecord.McIndex,
-					edacRecord.TopLayer,
-					edacRecord.MidLayer,
-					edacRecord.LowLayer,
-					edacRecord.Addr,
-					1<<edacRecord.GrainBits,
-					edacRecord.Syndrome,
-					strDriverDetail,
-				)
-			case HW_ERR_NON_STANDARD:
-				tracerData.Device = "ACPI"
-				tracerData.Event = "NON_STANDARD"
-
-				type tpAcpiNonStandardRecord struct {
-					Pad          uint64
-					SecType      [16]uint8
-					FruID        [16]uint8
-					FruTxtOffset uint32
-					Sev          uint8
-					Pattern      [3]uint8
-					Len          uint32
-					BufOffset    uint32
-					Msg          [DETAIL_INFO_SIZE_NON_STANDARD]byte
-				}
-				nonStandardRecord := &tpAcpiNonStandardRecord{}
-
-				reader := bytes.NewReader(data.Info[:])
-				err := binary.Read(reader, binary.LittleEndian, nonStandardRecord)
-				if err != nil {
-					return fmt.Errorf("parse acpi non_standard detail info error: %w", err)
-				}
-
-				if nonStandardRecord.Sev < 2 {
-					tracerData.ErrType = Corrected
-				} else {
-					tracerData.ErrType = RecovPanic
-				}
-
-				// get fruTxt
-				fruTxt := nonStandardRecord.Msg[:]
-				fruTxtOffset := nonStandardRecord.FruTxtOffset&0xffff - 56
-				strFruTxtEnd := bytes.IndexByte(fruTxt[fruTxtOffset:], 0)
-				strFruTxt := string(fruTxt[fruTxtOffset : int(fruTxtOffset)+strFruTxtEnd])
-
-				rawData, _ := CopyFromOffset(nonStandardRecord.Msg[:], int(fruTxtOffset), int(nonStandardRecord.Len))
-
-				tracerData.Info = fmt.Sprintf("severity: %d; "+
-					"sec type:%x; FRU: %x%s; "+
-					"data len:%d; raw data:% x",
-					nonStandardRecord.Sev,
-					nonStandardRecord.SecType,
-					nonStandardRecord.FruID,
-					strFruTxt,
-					nonStandardRecord.Len,
-					rawData,
-				)
-			case HW_ERR_AER_EVENT:
-				var strSeverity string
-				var strErrDetail string
-				var strTlpHeader string
-
-				tracerData.Event = "AER"
-
-				type tpAerEventRecord struct {
-					Pad            uint64
-					DevNameOffset  uint32
-					Status         uint32
-					Severity       uint8
-					TlpHeaderValid uint8
-					Pattern        [2]uint8
-					TlpHeader      [4]uint32
-					Msg            [DETAIL_INFO_SIZE_AER]byte
-				}
-				aerEventRecord := &tpAerEventRecord{}
-
-				reader := bytes.NewReader(data.Info[:])
-				err := binary.Read(reader, binary.LittleEndian, aerEventRecord)
-				if err != nil {
-					return fmt.Errorf("parse PCIe detail info error: %w", err)
-				}
-
-				// get Device Name
-				msg := aerEventRecord.Msg[:]
-				devNameOffset := aerEventRecord.DevNameOffset&0xffff - 36
-				strDevNameEnd := bytes.IndexByte(msg[devNameOffset:], 0)
-				strDevName := string(msg[devNameOffset : int(devNameOffset)+strDevNameEnd])
-
-				if aerEventRecord.Severity == 2 {
-					var err error
-					strSeverity = "Corrected"
-					tracerData.ErrType = Corrected
-					strErrDetail, err = getPciErr(aerEventRecord.Status, true)
-					if err != nil {
-						return fmt.Errorf("parse PCIe correctable error status error: %w", err)
-					}
-				} else {
-					var err error
-					if aerEventRecord.Severity == 1 {
-						strSeverity = "Fatal"
-						tracerData.ErrType = Fatal
-					} else {
-						strSeverity = "Uncorrected, non-fatal"
-						tracerData.ErrType = Uncorrected
-					}
-					strErrDetail, err = getPciErr(aerEventRecord.Status, false)
-					if err != nil {
-						return fmt.Errorf("parse PCIe uncorrectable error status error: %w", err)
-					}
-				}
-
-				if aerEventRecord.TlpHeaderValid != 0 {
-					strTlpHeader = fmt.Sprintf("{%#x,%#x,%#x,%#x}",
-						aerEventRecord.TlpHeader[0],
-						aerEventRecord.TlpHeader[1],
-						aerEventRecord.TlpHeader[2],
-						aerEventRecord.TlpHeader[3])
-				} else {
-					strTlpHeader = "Not available"
-				}
-
-				tracerData.Device = fmt.Sprintf("PCIe %s", strDevName)
-
-				tracerData.Info = fmt.Sprintf("%s "+
-					"PCIe Bus Error: severity=%s, "+
-					"%s, TLP Header=%s",
-					strDevName, strSeverity, strErrDetail, strTlpHeader)
+				nextThrAllowed = now.Add(ras.thrBackoff.Duration())
 			}
 
-			storage.Save("ras", "", time.Now(), tracerData)
+			tracerData, err := dispatchRasTracerData(&ev)
+			if err != nil {
+				continue
+			}
+
+			if err := tracing.Save(&tracing.WriteRequest{
+				TracerName: "ras",
+				TracerTime: time.Now(),
+				TracerData: tracerData,
+			}); err != nil {
+				log.Warnf("failed to save tracing data: %v", err)
+			}
 		}
 	}
-}
-
-func getThrInfo() (uint64, error) {
-	file, err := os.Open(interruptsPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open interrupts: %w", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "THR") {
-			var nums []uint64
-			var sum uint64
-
-			for _, field := range strings.Fields(line) {
-				if num, err := strconv.ParseUint(field, 10, 64); err == nil {
-					nums = append(nums, num)
-					sum += num
-				}
-			}
-
-			if len(nums) == 0 {
-				return 0, fmt.Errorf("failed to find nums")
-			}
-			return sum, nil
-		}
-	}
-	return 0, fmt.Errorf("didn't find interrupts info")
 }
 
 func (ras *rasTracing) Update() ([]*metric.Data, error) {
-	count, err := getThrInfo()
-	if err != nil {
-		return nil, err
+	metrics := make([]*metric.Data, maxNumHWErrTypes)
+	for i, typeLabel := range hwErrTypeLabels {
+		metrics[i] = metric.NewCounterData(
+			"hw_err_total",
+			float64(ras.counts[i].Load()),
+			"total RAS hardware error events by source type",
+			map[string]string{labelType: typeLabel},
+		)
 	}
-
-	if thresholdCount < count {
-		delta := count - thresholdCount
-		thresholdCount = count
-		atomic.AddUint64(&ras.count, 1)
-
-		tracerData := &RasTracingData{}
-
-		tracerData.Device = "ACPI"
-		tracerData.Event = "Threshold APIC interrupts"
-		tracerData.ErrType = Corrected
-		tracerData.Info = fmt.Sprintf("%d threshold interrupts occurred, totaling %d", delta, thresholdCount)
-
-		storage.Save("ras", "", time.Now(), tracerData)
-	}
-
-	return []*metric.Data{
-		metric.NewCounterData("hw_total", float64(atomic.LoadUint64(&ras.count)),
-			"ras counter", nil),
-	}, nil
+	return metrics, nil
 }
